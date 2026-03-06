@@ -1,0 +1,9 @@
+# Core
+requests>=2.31.0
+
+# Gemini provider (default, ~$0.01/company)
+google-genai>=0.8.0
+
+# OpenAI provider (optional, ~$0.03/company)
+# Uncomment if using --provider openai
+# openai>=1.0.0
