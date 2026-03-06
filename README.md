@@ -2,7 +2,7 @@
 
 Estimates annual revenue for private companies using AI-powered web research.
 
-The core contribution is a **deterministic confidence scoring methodology** — rather than asking an LLM "how confident are you?" (inconsistent, expensive), the system collects structured source data and scores confidence in pure Python based on source quality, count, and variance. Results are reproducible and comparable across your entire prospect list.
+The core contribution is a **rules-based confidence scoring methodology** — rather than asking an LLM "how confident are you?" (inconsistent, expensive), the system collects structured source data and scores confidence in pure Python based on source quality, count, and variance. The scoring logic is fully deterministic given its inputs; note that credibility scores and source tiers are LLM-assigned, so two runs may produce slightly different raw inputs but the tier logic itself is stable.
 
 ```
 $ python revenue_estimator.py --domain north40.com --company-name "North 40 Outfitters"
@@ -27,7 +27,7 @@ Researching North 40 Outfitters (north40.com) via gemini... done (8.4s)
   Red flags:    all_aggregators
 ```
 
-**Cost:** ~$0.01/company (Gemini) | ~$0.03/company (OpenAI)
+**Cost:** ~$0.04/company (Gemini, includes Search Grounding) | ~$0.03/company (OpenAI)
 **Accuracy:** ~80-85% vs. manual research
 
 ---
@@ -160,7 +160,7 @@ how much does Batteries Plus make?
 |---|---|---|
 | Model | gemini-2.0-flash | gpt-4o |
 | Search | Google Search grounding | web_search_preview |
-| Cost/company | ~$0.01 | ~$0.03 |
+| Cost/company | ~$0.04 (incl. Search Grounding) | ~$0.03 |
 | Speed | ~8s | ~15s |
 | Accuracy | ~80-85% | ~80-85% |
 

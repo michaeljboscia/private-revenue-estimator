@@ -117,7 +117,7 @@ Return ONLY valid JSON matching this schema — no markdown, no explanation.
 
 ## Step 2a: Validation Fallback (0 estimates returned)
 
-Call `mcp__gemini__gemini-search` with query: `"{company_name}" annual revenue estimate 2025`
+Call `mcp__gemini__gemini-search` with query: `"{company_name}" annual revenue estimate {current year}`
 
 Then call `mcp__gemini__gemini-extract` on those results using the same `revenue_estimates` array schema from Step 2.
 

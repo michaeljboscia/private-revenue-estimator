@@ -34,9 +34,6 @@ import csv
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-import requests
-
-
 # =============================================================================
 # Research Prompt
 # =============================================================================
@@ -120,27 +117,45 @@ Return ONLY valid JSON (no markdown, no code blocks) matching this exact structu
 
 def extract_json(text: str) -> Dict[str, Any]:
     """
-    Extract JSON from an LLM response, handling markdown code blocks and
-    responses with leading/trailing text.
+    Extract JSON from an LLM response, handling markdown code blocks,
+    citation markers injected by search grounding, and multiple JSON blocks.
+
+    Uses JSONDecoder.raw_decode to find the first complete, valid JSON object
+    rather than greedy regex (which breaks when the response contains multiple
+    brace-delimited blocks).
     """
+    # Strip citation markers Gemini injects when using search grounding: [1], [2] etc.
+    cleaned = re.sub(r'\[\d+\]', '', text)
+
+    # Try direct parse first
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+    # Try markdown code block
+    match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', cleaned)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
 
-    match = re.search(r'\{[\s\S]*\}', text)
-    if match:
+    # Walk the string finding '{' and attempt raw_decode from each position.
+    # This correctly handles responses with multiple JSON-like blocks.
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(cleaned):
+        idx = cleaned.find('{', idx)
+        if idx == -1:
+            break
         try:
-            return json.loads(match.group(0))
+            obj, _ = decoder.raw_decode(cleaned, idx)
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
+        idx += 1
 
     return {
         "parse_error": True,
@@ -190,7 +205,10 @@ def research_with_gemini(domain: str, company_name: str, api_key: str) -> Dict[s
 
 def research_with_openai(domain: str, company_name: str, api_key: str) -> Dict[str, Any]:
     """
-    Research revenue using OpenAI with web search (Responses API).
+    Research revenue using OpenAI with built-in web search.
+
+    Uses gpt-4o-search-preview which has web search baked in via the standard
+    Chat Completions API — no beta Responses API required.
     """
     try:
         from openai import OpenAI
@@ -202,13 +220,12 @@ def research_with_openai(domain: str, company_name: str, api_key: str) -> Dict[s
     client = OpenAI(api_key=api_key)
     prompt = RESEARCH_PROMPT.format(company_name=company_name, domain=domain)
 
-    response = client.responses.create(
-        model="gpt-4o",
-        tools=[{"type": "web_search_preview"}],
-        input=f"{prompt}\n\nCompany: {company_name} (domain: {domain})"
+    response = client.chat.completions.create(
+        model="gpt-4o-search-preview",
+        messages=[{"role": "user", "content": f"{prompt}\n\nCompany: {company_name} (domain: {domain})"}]
     )
 
-    data = extract_json(response.output_text)
+    data = extract_json(response.choices[0].message.content)
     data.setdefault("domain", domain)
     data.setdefault("company_name", company_name)
     return data
@@ -217,13 +234,17 @@ def research_with_openai(domain: str, company_name: str, api_key: str) -> Dict[s
 # =============================================================================
 # Confidence Scoring
 #
-# This is the core methodological contribution: deterministic confidence scoring
+# This is the core methodological contribution: rules-based confidence scoring
 # based on source quality, count, and variance — no LLM call required.
 #
-# Why deterministic?
+# Why rules-based?
 #   Asking an LLM "how confident are you?" produces inconsistent results across
-#   runs and companies. A rules-based system gives reproducible scores that can
-#   be compared across your entire prospect list.
+#   runs and companies. A deterministic system gives scores you can sort, filter,
+#   and act on across your entire prospect list.
+#
+#   Note: the LLM assigns credibility_score and source_tier as inputs, so two
+#   runs may produce slightly different raw scores. The confidence tier logic
+#   itself is fully deterministic given those inputs.
 # =============================================================================
 
 def calculate_confidence(data: Dict[str, Any]) -> str:
@@ -233,40 +254,47 @@ def calculate_confidence(data: Dict[str, Any]) -> str:
     Returns one of: HIGH | MODERATE-HIGH | MODERATE | LOW | INSUFFICIENT
 
     Base tiers:
-        HIGH:          best source >= 80, 2+ sources, variance <= 20%
-        MODERATE-HIGH: best source >= 70, 2+ sources, variance <= 40%
+        HIGH:          best source >= 80, 2+ valid sources, variance <= 20%
+        MODERATE-HIGH: best source >= 70, 2+ valid sources, variance <= 40%
                        (or single source >= 80)
-        MODERATE:      best source >= 50, 2+ sources
+        MODERATE:      best source >= 50, 2+ valid sources
                        (or single source >= 60)
         LOW:           data found but doesn't meet above thresholds
-        INSUFFICIENT:  no estimates found
+        INSUFFICIENT:  no estimates with valid amounts found
 
     Overrides:
-        >500% variance  -> cap at MODERATE (sources too far apart to trust)
-        stale_data flag -> downgrade one level (data is >3 years old)
+        sources spread >5x  -> cap at MODERATE (too far apart to trust)
+        stale_data flag      -> downgrade one level, but never below LOW
     """
     estimates = data.get("revenue_estimates", [])
-    if not estimates:
+
+    # Only count estimates with actual amounts — zero/missing amounts don't
+    # contribute to revenue confidence even if the source has a credibility score.
+    valid = [e for e in estimates if e.get("amount_millions", 0) > 0]
+    if not valid:
         return "INSUFFICIENT"
 
-    best_score = max(e.get("credibility_score", 0) for e in estimates)
-    count = len(estimates)
-    amounts = [e["amount_millions"] for e in estimates if e.get("amount_millions", 0) > 0]
+    best_score = max(e.get("credibility_score", 0) for e in valid)
+    count = len(valid)
+    amounts = [e["amount_millions"] for e in valid]
 
-    variance_pct = 0.0
-    if len(amounts) >= 2:
-        mean = sum(amounts) / len(amounts)
-        if mean > 0:
-            variance_pct = (max(amounts) - min(amounts)) / mean * 100
+    # Use max/min ratio to detect outlier sources (e.g. $10M vs $60M = 6x spread).
+    # Mean-based variance caps at ~200% for two data points, making a >300% or >500%
+    # threshold mathematically unreachable. Ratio-based comparison has no such limit.
+    spread_ratio = max(amounts) / min(amounts) if min(amounts) > 0 else 1.0
+
+    # Variance percentage for display purposes only (used in format_result)
+    mean = sum(amounts) / len(amounts)
+    variance_pct_display = (max(amounts) - min(amounts)) / mean * 100 if mean > 0 else 0.0
 
     red_flags = data.get("research_quality", {}).get("red_flags", [])
-    high_variance = variance_pct > 500 or "high_variance" in red_flags
+    high_variance = spread_ratio > 5.0 or "high_variance" in red_flags
     stale = "stale_data" in red_flags
 
     # Base tier
-    if best_score >= 80 and count >= 2 and variance_pct <= 20:
+    if best_score >= 80 and count >= 2 and variance_pct_display <= 20:
         confidence = "HIGH"
-    elif best_score >= 70 and count >= 2 and variance_pct <= 40:
+    elif best_score >= 70 and count >= 2 and variance_pct_display <= 40:
         confidence = "MODERATE-HIGH"
     elif best_score >= 80 and count == 1:
         confidence = "MODERATE-HIGH"
@@ -277,11 +305,13 @@ def calculate_confidence(data: Dict[str, Any]) -> str:
     else:
         confidence = "LOW"
 
-    # Overrides
+    # Override: extreme spread caps at MODERATE
     if high_variance and confidence in ("HIGH", "MODERATE-HIGH"):
         confidence = "MODERATE"
 
-    if stale and confidence != "INSUFFICIENT":
+    # Override: stale data downgrades one level, but never below LOW
+    # (INSUFFICIENT means "no data found" — stale data is still data)
+    if stale and confidence not in ("INSUFFICIENT", "LOW"):
         order = ["INSUFFICIENT", "LOW", "MODERATE", "MODERATE-HIGH", "HIGH"]
         confidence = order[max(0, order.index(confidence) - 1)]
 
@@ -350,11 +380,13 @@ def print_result(result: Dict[str, Any]) -> None:
     if result.get("revenue_estimates"):
         print(f"\n  All estimates ({result['sources_found']} found):")
         for e in result["revenue_estimates"]:
+            amount = str(e.get("amount_display") or "N/A")
+            score = e.get("credibility_score") or 0
             print(
-                f"    {e.get('amount_display'):>8}  "
-                f"Tier {e.get('source_tier')}  "
-                f"{e.get('credibility_score'):>3}/100  "
-                f"{e.get('source_name')} ({e.get('year', '?')})"
+                f"    {amount:>8}  "
+                f"Tier {e.get('source_tier', '?')}  "
+                f"{score:>3}/100  "
+                f"{e.get('source_name', 'Unknown')} ({e.get('year', '?')})"
             )
 
     if result.get("variance_pct", 0) > 0:
@@ -460,7 +492,7 @@ environment variables:
     parser.add_argument("--company-name", help="Company name (derived from domain if omitted)")
     parser.add_argument(
         "--provider", choices=["gemini", "openai"], default="gemini",
-        help="AI provider (default: gemini, ~$0.01/co | openai, ~$0.03/co)"
+        help="AI provider (default: gemini, ~$0.04/co | openai, ~$0.03/co)"
     )
     parser.add_argument(
         "--batch", metavar="FILE",
