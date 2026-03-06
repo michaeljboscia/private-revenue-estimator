@@ -6,7 +6,7 @@ Estimates annual revenue for private companies using AI-powered web research.
 
 The core contribution is the confidence scoring methodology:
   - 4-tier source hierarchy (SEC filings → CEO interviews → trade journals → aggregators)
-  - Deterministic 5-tier confidence scoring based on source quality, count, and variance
+  - Rules-based 5-tier confidence scoring based on source quality, count, and variance
   - Automatic overrides for high variance and stale data
 
 Supports Google Gemini (recommended) and OpenAI as research providers.
@@ -17,7 +17,7 @@ Usage:
     python revenue_estimator.py --domain acme.com --provider openai
     python revenue_estimator.py --batch companies.csv --json
 
-Cost:     ~$0.01/company (Gemini) | ~$0.03/company (OpenAI)
+Cost:     ~$0.04/company (Gemini, incl. Search Grounding) | ~$0.03/company (OpenAI)
 Accuracy: ~80-85% vs. manual research
 
 Environment:
@@ -209,6 +209,10 @@ def research_with_openai(domain: str, company_name: str, api_key: str) -> Dict[s
 
     Uses gpt-4o-search-preview which has web search baked in via the standard
     Chat Completions API — no beta Responses API required.
+
+    Note: if you get a NotFoundError, this model may have been renamed or
+    require a higher-tier OpenAI plan. Check https://platform.openai.com/docs/models
+    for the current model name that supports web search via Chat Completions.
     """
     try:
         from openai import OpenAI
@@ -451,6 +455,8 @@ def process_company(
             "success": False,
             "domain": domain,
             "company": company_name,
+            "provider": provider,
+            "research_date": datetime.now().strftime("%Y-%m-%d"),
             "error": str(e),
             "elapsed_seconds": round((datetime.now() - start).total_seconds(), 1)
         }
