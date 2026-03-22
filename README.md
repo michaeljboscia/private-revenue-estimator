@@ -177,4 +177,4 @@ how much does Batteries Plus make?
 
 ## License
 
-MIT
+[FSL-1.1-ALv2](LICENSE) — Free for internal use, education, and research. Commercial competing use prohibited for 2 years per release, then auto-converts to Apache 2.0.
